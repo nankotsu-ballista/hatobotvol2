@@ -7,9 +7,11 @@ CEX-CEX Spread Alert + Indicator Alerts (Discord)
 - CEX間スプレッド監視（閾値bps超えで通知）
 - ブラックリストや閾値は config.json で動的変更（自動リロード）
 - ETHのBB(ボリンジャー)＋RSIクロスで別チャンネル通知
+- 追加: BYBIT_AUTO_ALL（Bybit上場銘柄“全て”自動監視：スポット）
+- 追加: 起動時に「デプロイ完了」をDiscordへ通知
+- 追加: 大量銘柄向けに batch_size / max_concurrency を追加
 
-依存: pip install aiohttp python-dotenv
-Render常駐: render.yaml 同梱。Persistent Diskに /data を割当て、CONFIG_PATH=/data/config.json を読む。
+依存: aiohttp, python-dotenv
 """
 
 import os
@@ -21,16 +23,17 @@ from typing import Dict, Tuple, List, Optional
 import aiohttp
 from aiohttp import ClientSession
 from dotenv import load_dotenv
+from datetime import datetime, timezone, timedelta
 
 load_dotenv()
 
 DEFAULT_CONFIG_PATH = os.getenv("CONFIG_PATH", "config.json")
-HTTP_TIMEOUT = aiohttp.ClientTimeout(total=6.0, connect=4.0)
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=8.0, connect=5.0)
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 INDICATOR_WEBHOOK_URL_ENV = os.getenv("INDICATOR_WEBHOOK_URL", "").strip()
 
-# ------------- 取引所フェッチャ（略、前回と同じ） -------------
+# ------------- 取引所フェッチャ -------------
 async def fetch_binance(session: ClientSession, pair: str):
     base, quote = pair.split("-")
     symbol = f"{base}{quote}".upper()
@@ -65,7 +68,10 @@ async def fetch_bybit(session: ClientSession, pair: str):
     try:
         async with session.get(url) as r:
             j = await r.json()
-        data = j["result"]["list"][0]
+        lst = j.get("result", {}).get("list", [])
+        if not lst:
+            return None
+        data = lst[0]
         bid = float(data["bid1Price"]); ask = float(data["ask1Price"])
         mid = (bid + ask) / 2.0
         return mid, bid, ask, time.time()
@@ -93,6 +99,8 @@ async def fetch_gate(session: ClientSession, pair: str):
     try:
         async with session.get(url) as r:
             j = await r.json()
+        if not isinstance(j, list) or not j:
+            return None
         data = j[0]
         bid = float(data["highest_bid"]); ask = float(data["lowest_ask"])
         mid = (bid + ask) / 2.0
@@ -159,7 +167,6 @@ def fmt_price(p: float) -> str:
 
 async def discord_notify(session: ClientSession, url: str, content: str):
     if not url:
-        print("[WARN] Discord webhook URL not set. Skip:", content[:120])
         return
     try:
         async with session.post(url, json={"content": content}) as r:
@@ -168,6 +175,10 @@ async def discord_notify(session: ClientSession, url: str, content: str):
                 print(f"[ERR] Discord {r.status}: {txt}")
     except Exception as e:
         print(f"[ERR] Discord error: {e}")
+
+def jst_now_str():
+    jst = timezone(timedelta(hours=9))
+    return datetime.now(tz=jst).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 class Config:
     def __init__(self, path: str):
@@ -185,6 +196,8 @@ class Config:
             "cooldown_sec": 300,
             "interval_sec": 3.0,
             "renotify_delta_bps": 10.0,
+            "batch_size": 40,
+            "max_concurrency": 20,
             "indicator": {
                 "enabled": True,
                 "symbol": "ETH-USDT",
@@ -198,7 +211,8 @@ class Config:
                 "cooldown_sec": 1200,
                 "interval_sec": 10.0,
                 "webhook_url": ""
-            }
+            },
+            "on_deploy_message": True
         }
 
     def load(self):
@@ -212,7 +226,6 @@ class Config:
             print(f"[INFO] config reloaded from {self.path}")
             return True
         except FileNotFoundError:
-            # create parent dir and write default config
             try:
                 os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
                 self.data = self._default()
@@ -233,20 +246,17 @@ class Config:
         return self.data.get(key, default)
 
 _last_alert: Dict[Tuple[str, str, str], Tuple[float, float]] = {}
+_pair_offset = 0
+_auto_cache = {"mode": "", "pairs": [], "ts": 0.0}
 
-def should_notify_spread(key: Tuple[str, str, str], bps: float, now: float, cfg: Config) -> bool:
-    prev = _last_alert.get(key)
-    cd = float(cfg.get("cooldown_sec", 300))
-    delta = float(cfg.get("renotify_delta_bps", 10.0))
-    if prev is None:
-        return True
-    last_bps, last_ts = prev
-    if (now - last_ts) < cd and (bps - last_bps) < delta:
-        return False
-    return True
-
-def record_spread(key: Tuple[str, str, str], bps: float, now: float):
-    _last_alert[key] = (bps, now)
+def compute_spread_bps(mids: Dict[str, float]) -> Optional[Tuple[float, str, str, float, float]]:
+    if len(mids) < 2: return None
+    min_ex = min(mids, key=lambda k: mids[k])
+    max_ex = max(mids, key=lambda k: mids[k])
+    min_p = mids[min_ex]; max_p = mids[max_ex]
+    if min_p <= 0: return None
+    bps = (max_p / min_p - 1.0) * 10000.0
+    return bps, min_ex, max_ex, min_p, max_p
 
 async def fetch_all_for_pair(session: ClientSession, pair: str, exchanges: List[str]):
     tasks = []
@@ -261,55 +271,132 @@ async def fetch_all_for_pair(session: ClientSession, pair: str, exchanges: List[
         out[ex] = res
     return out
 
-def compute_spread_bps(mids: Dict[str, float]) -> Optional[Tuple[float, str, str, float, float]]:
-    if len(mids) < 2: return None
-    min_ex = min(mids, key=lambda k: mids[k])
-    max_ex = max(mids, key=lambda k: mids[k])
-    min_p = mids[min_ex]; max_p = mids[max_ex]
-    if min_p <= 0: return None
-    bps = (max_p / min_p - 1.0) * 10000.0
-    return bps, min_ex, max_ex, min_p, max_p
+async def bybit_all_pairs(session: ClientSession) -> List[str]:
+    url = "https://api.bybit.com/v5/market/tickers?category=spot"
+    async with session.get(url) as r:
+        j = await r.json()
+    items = j.get("result", {}).get("list", [])
+    pairs = []
+    known_quotes = {"USDT","USDC","USD","BTC","ETH","DAI","EUR","TRY","BRL"}
+    for x in items:
+        sym = x.get("symbol","").upper()
+        matched = False
+        for q in sorted(known_quotes, key=len, reverse=True):
+            if sym.endswith(q) and len(sym) > len(q):
+                base = sym[:-len(q)]
+                pairs.append(f"{base}-{q}")
+                matched = True
+                break
+        if not matched:
+            pass
+    pairs = sorted(list(dict.fromkeys(pairs)))
+    return pairs
+
+async def resolve_pairs(session: ClientSession, cfg: Config) -> List[str]:
+    global _auto_cache
+    raw = cfg.get("pairs", [])
+    if isinstance(raw, str) and raw.upper() == "BYBIT_AUTO_ALL":
+        ttl = 600.0
+        if _auto_cache["mode"] != "BYBIT_AUTO_ALL" or (time.time() - _auto_cache["ts"]) > ttl:
+            pairs = await bybit_all_pairs(session)
+            _auto_cache = {"mode":"BYBIT_AUTO_ALL","pairs":pairs,"ts":time.time()}
+            print(f"[INFO] BYBIT_AUTO_ALL resolved {len(pairs)} pairs")
+        return _auto_cache["pairs"]
+    if isinstance(raw, list):
+        return [p.upper() for p in raw]
+    return []
 
 async def spread_loop(cfg: Config):
+    global _pair_offset
     async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
+        if cfg.get("on_deploy_message", True):
+            ts = jst_now_str()
+            msg = f"🚀 デプロイ完了 / サービス起動: {ts}"
+            await discord_notify(session, DISCORD_WEBHOOK_URL, msg)
+            if INDICATOR_WEBHOOK_URL_ENV and INDICATOR_WEBHOOK_URL_ENV != DISCORD_WEBHOOK_URL:
+                await discord_notify(session, INDICATOR_WEBHOOK_URL_ENV, msg)
         while True:
             try:
                 cfg.load()
-                pairs = [p.upper() for p in cfg.get("pairs", [])]
-                blacklist = set([p.upper() for p in cfg.get("blacklist_pairs", [])])
                 exchanges = [e for e in cfg.get("exchanges", []) if e in FETCHERS]
+                if len(exchanges) < 2:
+                    print("[WARN] exchanges 2以上に設定してください。現在:", exchanges)
                 default_thr = float(cfg.get("threshold_bps", 50.0))
-                pair_thr: Dict[str, float] = {k.upper(): float(v) for k, v in cfg.get("pair_threshold_bps", {}).items()}
+                thr_map: Dict[str, float] = {k.upper(): float(v) for k, v in cfg.get("pair_threshold_bps", {}).items()}
+                blacklist = set([p.upper() for p in cfg.get("blacklist_pairs", [])])
                 interval = float(cfg.get("interval_sec", 3.0))
-                for pair in pairs:
+                batch_size = int(cfg.get("batch_size", 40))
+                max_conc = int(cfg.get("max_concurrency", 20))
+
+                pairs_all = await resolve_pairs(session, cfg)
+                if not pairs_all:
+                    await asyncio.sleep(interval); continue
+
+                start = _pair_offset % len(pairs_all)
+                end = start + batch_size
+                if end <= len(pairs_all):
+                    pairs_batch = pairs_all[start:end]
+                else:
+                    pairs_batch = pairs_all[start:] + pairs_all[:(end % len(pairs_all))]
+                _pair_offset = end
+
+                sem = asyncio.Semaphore(max_conc)
+                results = []
+
+                async def worker(pair):
+                    nonlocal results
                     if pair in blacklist:
-                        continue
-                    data = await fetch_all_for_pair(session, pair, exchanges)
-                    if not data: continue
-                    mids = {ex: v[0] for ex, v in data.items()}
-                    r = compute_spread_bps(mids)
-                    if r is None: continue
-                    bps, min_ex, max_ex, min_p, max_p = r
-                    thr = pair_thr.get(pair, default_thr)
-                    if bps >= thr:
-                        key = (pair, min_ex, max_ex)
+                        return
+                    async with sem:
                         now = time.time()
-                        if should_notify_spread(key, bps, now, cfg):
-                            line = " | ".join(f"{ex}:{fmt_price(v[0])}" for ex, v in sorted(data.items(), key=lambda kv: kv[1][0]))
-                            msg = (
-                                f"**[SPREAD] {pair} 乖離検知**\n"
-                                f"{min_ex} → {max_ex} で **{bps:.1f} bps**（約 {(bps/100):.2f}% ）閾値 {thr:.1f} bps\n"
-                                f"Buy @{min_ex}: {fmt_price(min_p)} / Sell @{max_ex}: {fmt_price(max_p)}\n"
-                                f"全MID: {line}\n"
-                                f"※手数料/出入金/サイズ影響は未控除。"
-                            )
-                            await discord_notify(session, DISCORD_WEBHOOK_URL, msg)
-                            record_spread(key, bps, now)
+                        data = await fetch_all_for_pair(session, pair, exchanges)
+                        if not data or len(data) < 2:
+                            return
+                        mids = {ex: v[0] for ex, v in data.items()}
+                        r = compute_spread_bps(mids)
+                        if r is None:
+                            return
+                        bps, min_ex, max_ex, min_p, max_p = r
+                        thr = thr_map.get(pair, default_thr)
+                        if bps < thr:
+                            return
+                        results.append((pair, bps, min_ex, max_ex, min_p, max_p, data, thr, now))
+
+                tasks = [asyncio.create_task(worker(p)) for p in pairs_batch]
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+                for (pair, bps, min_ex, max_ex, min_p, max_p, data, thr, now) in results:
+                    key = (pair, min_ex, max_ex)
+                    prev = _last_alert.get(key)
+                    cd = float(cfg.get("cooldown_sec", 300))
+                    delta = float(cfg.get("renotify_delta_bps", 10.0))
+                    should = False
+                    if prev is None:
+                        should = True
+                    else:
+                        last_bps, last_ts = prev
+                        if (now - last_ts) >= cd or (bps - last_bps) >= delta:
+                            should = True
+                    if not should:
+                        continue
+                    line = " | ".join(f"{ex}:{fmt_price(v[0])}" for ex, v in sorted(data.items(), key=lambda kv: kv[1][0]))
+                    msg = (
+                        f"**[SPREAD] {pair} 乖離検知**\n"
+                        f"{min_ex} → {max_ex} で **{bps:.1f} bps**（約 {(bps/100):.2f}% ）閾値 {thr:.1f} bps\n"
+                        f"Buy @{min_ex}: {fmt_price(min_p)} / Sell @{max_ex}: {fmt_price(max_p)}\n"
+                        f"全MID: {line}\n"
+                        f"※手数料/出入金/サイズ影響は未控除。"
+                    )
+                    await discord_notify(session, DISCORD_WEBHOOK_URL, msg)
+                    _last_alert[key] = (bps, now)
+
                 await asyncio.sleep(interval)
             except Exception as e:
                 print(f"[ERR] spread_loop: {e}")
                 await asyncio.sleep(2.0)
 
+# ---- Indicator (ETH BB+RSI) ----
 def rsi(values: List[float], period: int) -> List[float]:
     if len(values) < period + 1:
         return []
