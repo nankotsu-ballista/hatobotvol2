@@ -1,0 +1,41 @@
+{
+  "pairs": [
+    "BTC-USDT",
+    "ETH-USDT",
+    "SOL-USDT"
+  ],
+  "exchanges": [
+    "binance",
+    "okx",
+    "bybit",
+    "kucoin",
+    "gate",
+    "mexc",
+    "htx",
+    "coinbase"
+  ],
+  "threshold_bps": 50.0,
+  "pair_threshold_bps": {
+    "BTC-USDT": 30.0
+  },
+  "blacklist_pairs": [
+    "DOGE-USDT"
+  ],
+  "cooldown_sec": 300,
+  "interval_sec": 3.0,
+  "renotify_delta_bps": 10.0,
+  "indicator": {
+    "enabled": true,
+    "symbol": "ETH-USDT",
+    "source_exchange": "binance",
+    "timeframe": "5m",
+    "bb_period": 20,
+    "bb_std": 2.0,
+    "rsi_period": 14,
+    "rsi_buy_cross": 30,
+    "rsi_sell_cross": 70,
+    "cooldown_sec": 1200,
+    "interval_sec": 10.0,
+    "webhook_url": ""
+  }
+}
