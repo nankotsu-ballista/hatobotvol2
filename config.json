@@ -2,7 +2,7 @@
   "pairs": "BYBIT_AUTO_ALL",
   "exchanges": ["bybit","coincheck","bitflyer","binance","okx"],
   "threshold_bps": 40.0,
-  "pair_threshold_bps": { "BTC-X": 25.0 },  
+  "pair_threshold_bps": { "BTC-X": 25.0 },   
   "batch_size": 40,
   "max_concurrency": 20,
   "interval_sec": 3.0,
@@ -11,7 +11,7 @@
 
   "cross_compare": {
     "enabled": true,
-    "bases": ["BTC"],        
+    "bases": ["BTC"],      
     "numeraire": "JPY",     
     "interval_sec": 5.0
   },
