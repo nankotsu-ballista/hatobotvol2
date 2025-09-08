@@ -1,16 +1,22 @@
 {
   "pairs": "BYBIT_AUTO_ALL",
-  "exchanges": ["bybit","binance","okx","gate","mexc"],   // 取引所間比較なので2つ以上
+  "exchanges": ["bybit","coincheck","bitflyer","binance","okx"],
   "threshold_bps": 40.0,
-  "batch_size": 50,                // 1ループで処理する銘柄数
-  "max_concurrency": 20,           // 同時リクエスト数（429対策）
+  "pair_threshold_bps": { "BTC-X": 25.0 },   // ← BTCのクロス比較しきい値
+  "batch_size": 40,
+  "max_concurrency": 20,
   "interval_sec": 3.0,
-  "blacklist_pairs": [],
-  "indicator": {
+
+  "auto": { "bybit": { "allowed_quotes": ["USDT","USDC"], "min_usd_turnover_24h": 200000 } },
+
+  "cross_compare": {
     "enabled": true,
-    "symbol": "ETH-USDT",
-    "timeframe": "5m",
-    "bb_period": 20, "bb_std": 2.0, "rsi_period": 14
+    "bases": ["BTC"],        // ← Bybit vs CoincheckならまずBTC
+    "numeraire": "JPY",      // すべてJPYに換算して比較
+    "interval_sec": 5.0
   },
-  "on_deploy_message": true
+
+  "indicator": { "enabled": true, "symbol": "ETH-USDT", "timeframe": "5m" },
+  "on_deploy_message": true,
+  "blacklist_pairs": []
 }
