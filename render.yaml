@@ -3,15 +3,19 @@ services:
     name: cex-spread-discord-bot
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: bash -lc "mkdir -p /data && [ -f /data/config.json ] || cp config.json /data/config.json; CONFIG_PATH=/data/config.json python cex_spread_discord_bot.py"
-    plan: starter
+    startCommand: >
+      bash -lc "mkdir -p /data &&
+      [ -f /data/config.json ] || cp config.json /data/config.json;
+      CONFIG_PATH=/data/config.json python cex_spread_discord_bot.py"
     autoDeploy: true
+    plan: starter
     envVars:
       - key: DISCORD_WEBHOOK_URL
-        sync: false  # set in Render Dashboard
+        sync: false
       - key: INDICATOR_WEBHOOK_URL
-        sync: false  # set in Render Dashboard
+        sync: false
     disk:
       name: bot-data
       mountPath: /data
       sizeGB: 1
+
